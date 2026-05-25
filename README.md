@@ -190,11 +190,6 @@ Full trade-offs in [DESIGN.md](DESIGN.md) (written at project completion). Previ
 - **Why no ZooKeeper/etcd for leader election?** Static priority list at config time — acceptable simplification for portfolio scope. A production cluster would use KRaft.
 - **Why custom wire protocol instead of Kafka-compatible?** Protocol design is the learning objective. Kafka compatibility would require implementing 40+ API versions.
 
----
-
-## Project Context
-
-This is Project 2 of a [4-project portfolio](https://github.com/Utkarsh272) built over 10 weeks, targeting backend/distributed systems engineering roles. Project 1 — [RAG with Grounded Citations](https://github.com/Utkarsh272/rag-grounded) — is live.
 
 ---
 
