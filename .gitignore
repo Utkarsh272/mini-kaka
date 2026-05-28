@@ -1,0 +1,17 @@
+# Go
+/bin/
+*.test
+*.out
+/data/          # broker data directories — never commit segment files
+
+# Env
+.env
+*.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
