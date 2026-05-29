@@ -14,6 +14,8 @@ import (
 	"github.com/Utkarsh272/mini-kafka/internal/server"
 )
 
+// ---- Test client -----------------------------------------------------------
+
 type testClient struct {
 	conn   net.Conn
 	br     *bufio.Reader
@@ -67,13 +69,21 @@ func (c *testClient) recv(t *testing.T) (uint32, protocol.ErrorCode, []byte) {
 	return corrID, errCode, body[6:]
 }
 
+// ---- Server helpers --------------------------------------------------------
+
 func startTestServer(t *testing.T) string {
 	t.Helper()
 	dataDir := t.TempDir()
-	b := broker.NewBroker(1, "localhost", 0, dataDir)
+
+	b, err := broker.NewBroker(1, "localhost", 9092, dataDir)
+	if err != nil {
+		t.Fatalf("NewBroker: %v", err)
+	}
 	t.Cleanup(func() { b.Close() })
+
 	h := server.NewHandler(b)
 
+	// Grab a free port then release it before the server re-binds.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -88,6 +98,8 @@ func startTestServer(t *testing.T) string {
 	return addr
 }
 
+// ---- Payload encoders ------------------------------------------------------
+
 func encodeCreateTopic(topic string, partitions, rf int32) []byte {
 	var buf []byte
 	buf = protocol.AppendString(buf, topic)
@@ -98,13 +110,13 @@ func encodeCreateTopic(topic string, partitions, rf int32) []byte {
 
 func encodeProduce(topic string, partID int32, key, value []byte) []byte {
 	var buf []byte
-	buf = protocol.AppendInt16(buf, 1)
-	buf = protocol.AppendInt32(buf, 500)
-	buf = protocol.AppendInt32(buf, 1)
+	buf = protocol.AppendInt16(buf, 1)   // acks
+	buf = protocol.AppendInt32(buf, 500) // timeout_ms
+	buf = protocol.AppendInt32(buf, 1)   // topic_count
 	buf = protocol.AppendString(buf, topic)
-	buf = protocol.AppendInt32(buf, 1)
+	buf = protocol.AppendInt32(buf, 1) // part_count
 	buf = protocol.AppendInt32(buf, partID)
-	buf = protocol.AppendInt32(buf, 1)
+	buf = protocol.AppendInt32(buf, 1) // rec_count
 	buf = protocol.AppendBytes(buf, key)
 	buf = protocol.AppendBytes(buf, value)
 	return buf
@@ -112,12 +124,12 @@ func encodeProduce(topic string, partID int32, key, value []byte) []byte {
 
 func encodeFetch(topic string, partID int32, offset int64, maxBytes int32) []byte {
 	var buf []byte
-	buf = protocol.AppendInt32(buf, 500)
-	buf = protocol.AppendInt32(buf, 0)
-	buf = protocol.AppendInt32(buf, 1<<20)
-	buf = protocol.AppendInt32(buf, 1)
+	buf = protocol.AppendInt32(buf, 500)   // max_wait_ms
+	buf = protocol.AppendInt32(buf, 0)     // min_bytes
+	buf = protocol.AppendInt32(buf, 1<<20) // max_bytes
+	buf = protocol.AppendInt32(buf, 1)     // topic_count
 	buf = protocol.AppendString(buf, topic)
-	buf = protocol.AppendInt32(buf, 1)
+	buf = protocol.AppendInt32(buf, 1) // part_count
 	buf = protocol.AppendInt32(buf, partID)
 	buf = protocol.AppendInt64(buf, offset)
 	buf = protocol.AppendInt32(buf, maxBytes)
@@ -155,6 +167,8 @@ func encodeOffsetFetch(groupID, topic string, partID int32) []byte {
 	return buf
 }
 
+// ---- Tests -----------------------------------------------------------------
+
 func TestCreateTopicAndMetadata(t *testing.T) {
 	addr := startTestServer(t)
 	cli := newTestClient(t, addr)
@@ -170,8 +184,10 @@ func TestCreateTopicAndMetadata(t *testing.T) {
 		t.Fatalf("Metadata error: %v", errCode)
 	}
 
-	pos := 4 // skip broker count
-	brokerCount := int32(binary.BigEndian.Uint32(payload[0:]))
+	// Parse broker list, then topic list.
+	pos := 0
+	brokerCount := int32(binary.BigEndian.Uint32(payload[pos:]))
+	pos += 4
 	for i := int32(0); i < brokerCount; i++ {
 		pos += 4
 		hostLen := int(binary.BigEndian.Uint16(payload[pos:]))
@@ -216,13 +232,48 @@ func TestProduceAndFetch(t *testing.T) {
 	if errCode != protocol.ErrNone {
 		t.Fatalf("Fetch: %v", errCode)
 	}
-
 	pos := 4
 	nameLen := int(binary.BigEndian.Uint16(payload[pos:]))
 	pos += 2 + nameLen + 4 + 4 + 2 + 8
 	recCount := int32(binary.BigEndian.Uint32(payload[pos:]))
 	if int(recCount) != len(messages) {
 		t.Errorf("fetched %d records, want %d", recCount, len(messages))
+	}
+}
+
+func TestProduceAutoRoute(t *testing.T) {
+	// partitionID = -1 means broker routes using key hash / round-robin.
+	addr := startTestServer(t)
+	cli := newTestClient(t, addr)
+
+	cli.send(protocol.APIKeyCreateTopic, "p", encodeCreateTopic("routed", 4, 1))
+	cli.recv(t)
+
+	// Send 8 keyless records with partID=-1; they should round-robin.
+	for i := 0; i < 8; i++ {
+		cli.send(protocol.APIKeyProduce, "p",
+			encodeProduce("routed", -1, nil, []byte(fmt.Sprintf("msg-%d", i))))
+		_, errCode, _ := cli.recv(t)
+		if errCode != protocol.ErrNone {
+			t.Errorf("auto-route produce %d: %v", i, errCode)
+		}
+	}
+
+	// Each of the 4 partitions should have 2 records.
+	for partID := int32(0); partID < 4; partID++ {
+		cli.send(protocol.APIKeyFetch, "c", encodeFetch("routed", partID, 0, 1<<20))
+		_, errCode, payload := cli.recv(t)
+		if errCode != protocol.ErrNone {
+			t.Errorf("fetch partition %d: %v", partID, errCode)
+			continue
+		}
+		pos := 4
+		nameLen := int(binary.BigEndian.Uint16(payload[pos:]))
+		pos += 2 + nameLen + 4 + 4 + 2 + 8
+		recCount := int32(binary.BigEndian.Uint32(payload[pos:]))
+		if recCount != 2 {
+			t.Errorf("partition %d: got %d records, want 2", partID, recCount)
+		}
 	}
 }
 

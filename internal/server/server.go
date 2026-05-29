@@ -59,34 +59,99 @@ func (h *Handler) handleProduce(w io.Writer, hdr protocol.RequestHeader, payload
 	for _, t := range req.Topics {
 		tr := protocol.ProduceTopicResult{Topic: t.Topic}
 		for _, pp := range t.Partitions {
-			part, err := h.broker.GetPartition(t.Topic, pp.PartitionID)
-			if err != nil {
-				tr.Partitions = append(tr.Partitions, protocol.ProducePartitionResult{
-					PartitionID: pp.PartitionID,
-					ErrorCode:   protocol.ErrUnknownTopicPartition,
-					BaseOffset:  -1,
-				})
-				continue
-			}
+			// partitionID == -1 means "let the broker route it".
+			// partitionID >= 0 means the client chose explicitly.
+			targetPartID := pp.PartitionID
 
-			var baseOffset int64 = -1
-			var errCode protocol.ErrorCode
-			for i, rec := range pp.Records {
-				off, err := part.Append(rec.Key, rec.Value)
+			// For auto-routed batches: each record may carry its own key,
+			// so we group by routed partition and append individually.
+			// For explicit partitions: skip routing.
+			if targetPartID < 0 {
+				// Route each record independently (key-based or round-robin).
+				// Collect results per routed partition.
+				routedResults := make(map[int32]*protocol.ProducePartitionResult)
+
+				for _, rec := range pp.Records {
+					partID, err := h.broker.RoutePartition(t.Topic, rec.Key)
+					if err != nil {
+						// Topic doesn't exist.
+						tr.Partitions = append(tr.Partitions, protocol.ProducePartitionResult{
+							PartitionID: -1,
+							ErrorCode:   protocol.ErrUnknownTopicPartition,
+							BaseOffset:  -1,
+						})
+						goto nextPartition
+					}
+
+					part, err := h.broker.GetPartition(t.Topic, partID)
+					if err != nil {
+						if _, seen := routedResults[partID]; !seen {
+							routedResults[partID] = &protocol.ProducePartitionResult{
+								PartitionID: partID,
+								ErrorCode:   protocol.ErrUnknownTopicPartition,
+								BaseOffset:  -1,
+							}
+						}
+						continue
+					}
+
+					off, err := part.Append(rec.Key, rec.Value)
+					if err != nil {
+						slog.Error("append record", "topic", t.Topic, "partition", partID, "err", err)
+						if _, seen := routedResults[partID]; !seen {
+							routedResults[partID] = &protocol.ProducePartitionResult{
+								PartitionID: partID,
+								ErrorCode:   protocol.ErrUnknown,
+								BaseOffset:  -1,
+							}
+						}
+						continue
+					}
+
+					if _, seen := routedResults[partID]; !seen {
+						routedResults[partID] = &protocol.ProducePartitionResult{
+							PartitionID: partID,
+							ErrorCode:   protocol.ErrNone,
+							BaseOffset:  off,
+						}
+					}
+				}
+
+				for _, res := range routedResults {
+					tr.Partitions = append(tr.Partitions, *res)
+				}
+			} else {
+				// Explicit partition specified by client.
+				part, err := h.broker.GetPartition(t.Topic, targetPartID)
 				if err != nil {
-					slog.Error("append record", "topic", t.Topic, "partition", pp.PartitionID, "err", err)
-					errCode = protocol.ErrUnknown
-					break
+					tr.Partitions = append(tr.Partitions, protocol.ProducePartitionResult{
+						PartitionID: targetPartID,
+						ErrorCode:   protocol.ErrUnknownTopicPartition,
+						BaseOffset:  -1,
+					})
+					continue
 				}
-				if i == 0 {
-					baseOffset = off
+
+				var baseOffset int64 = -1
+				var errCode protocol.ErrorCode
+				for i, rec := range pp.Records {
+					off, err := part.Append(rec.Key, rec.Value)
+					if err != nil {
+						slog.Error("append record", "topic", t.Topic, "partition", targetPartID, "err", err)
+						errCode = protocol.ErrUnknown
+						break
+					}
+					if i == 0 {
+						baseOffset = off
+					}
 				}
+				tr.Partitions = append(tr.Partitions, protocol.ProducePartitionResult{
+					PartitionID: targetPartID,
+					ErrorCode:   errCode,
+					BaseOffset:  baseOffset,
+				})
 			}
-			tr.Partitions = append(tr.Partitions, protocol.ProducePartitionResult{
-				PartitionID: pp.PartitionID,
-				ErrorCode:   errCode,
-				BaseOffset:  baseOffset,
-			})
+		nextPartition:
 		}
 		topicResults = append(topicResults, tr)
 	}
@@ -107,7 +172,7 @@ func (h *Handler) handleFetch(w io.Writer, hdr protocol.RequestHeader, payload [
 
 	maxBytes := req.MaxBytes
 	if maxBytes <= 0 {
-		maxBytes = 1 << 20 // 1 MB default
+		maxBytes = 1 << 20
 	}
 
 	var topicResults []protocol.FetchTopicResult
@@ -181,7 +246,6 @@ func (h *Handler) handleMetadata(w io.Writer, hdr protocol.RequestHeader, payloa
 		Port:   h.broker.Port(),
 	}}
 
-	// Collect topic names to describe: empty request means all topics.
 	allTopics := h.broker.ListTopics()
 	var topicsToDescribe []string
 	if len(req.Topics) == 0 {
@@ -192,7 +256,6 @@ func (h *Handler) handleMetadata(w io.Writer, hdr protocol.RequestHeader, payloa
 		topicsToDescribe = req.Topics
 	}
 
-	// Build a name → *Topic map for O(1) lookup.
 	topicMap := make(map[string]*broker.Topic, len(allTopics))
 	for _, t := range allTopics {
 		topicMap[t.Name()] = t
@@ -307,13 +370,19 @@ func (h *Handler) handleCreateTopic(w io.Writer, hdr protocol.RequestHeader, pay
 		return
 	}
 
-	err = h.broker.CreateTopic(req.Topic, req.NumPartitions)
+	rf := req.ReplicationFactor
+	if rf < 1 {
+		rf = 1
+	}
+
+	err = h.broker.CreateTopic(req.Topic, req.NumPartitions, rf)
 	var errCode protocol.ErrorCode
 	if err != nil {
 		slog.Error("create topic", "topic", req.Topic, "err", err)
 		errCode = protocol.ErrTopicAlreadyExists
 	} else {
-		slog.Info("topic created", "topic", req.Topic, "partitions", req.NumPartitions)
+		slog.Info("topic created", "topic", req.Topic,
+			"partitions", req.NumPartitions, "rf", rf)
 	}
 
 	respPayload := protocol.EncodeCreateTopicResponse(req.Topic, errCode)
@@ -348,7 +417,7 @@ func (s *Server) ListenAndServe() error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			return nil // listener closed — normal shutdown
+			return nil
 		}
 		s.wg.Add(1)
 		go func(c net.Conn) {
@@ -367,12 +436,8 @@ func (s *Server) Close() error {
 	return nil
 }
 
-// serveConn handles one client connection for its lifetime. Requests are
-// processed sequentially; each response is written and flushed before reading
-// the next request. The correlation ID allows the client to match responses.
 func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
-
 	remote := conn.RemoteAddr().String()
 	slog.Info("client connected", "remote", remote)
 	defer slog.Info("client disconnected", "remote", remote)
@@ -388,9 +453,7 @@ func (s *Server) serveConn(conn net.Conn) {
 			}
 			return
 		}
-
 		s.handler.Handle(bw, hdr, payload)
-
 		if err := bw.Flush(); err != nil {
 			slog.Warn("flush response", "remote", remote, "err", err)
 			return

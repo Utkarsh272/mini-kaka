@@ -13,23 +13,30 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":9092", "TCP address to listen on")
-	dataDir := flag.String("data-dir", "/tmp/mini-kafka", "Root directory for partition log files")
+	dataDir := flag.String("data-dir", "/tmp/mini-kafka", "Root directory for partition log files and metadata db")
 	nodeID := flag.Int("node-id", 1, "Broker node ID")
 	host := flag.String("host", "localhost", "Advertised hostname (returned in Metadata responses)")
 	flag.Parse()
 
-	// Structured logging to stdout.
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
 
-	b := broker.NewBroker(int32(*nodeID), *host, int32(9092), *dataDir)
+	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+		slog.Error("create data dir", "err", err)
+		os.Exit(1)
+	}
+
+	b, err := broker.NewBroker(int32(*nodeID), *host, 9092, *dataDir)
+	if err != nil {
+		slog.Error("init broker", "err", err)
+		os.Exit(1)
+	}
 	defer b.Close()
 
 	h := server.NewHandler(b)
 	srv := server.NewServer(*addr, h)
 
-	// Graceful shutdown on SIGINT / SIGTERM.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
