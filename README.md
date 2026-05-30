@@ -1,6 +1,6 @@
 # Mini-Kafka
 
-> A from-scratch implementation of a durable, partitioned pub/sub system in Go — segment files, sparse index, CRC validation, custom binary TCP protocol, partition routing, and bbolt-backed metadata persistence. No Kafka client library used.
+> A from-scratch implementation of a durable, partitioned pub/sub system in Go — segment files, sparse index, CRC validation, custom binary TCP protocol, partition routing, consumer groups with range assignment, and bbolt-backed metadata persistence. No Kafka client library used.
 
 [![CI](https://github.com/Utkarsh272/mini-kafka/actions/workflows/ci.yml/badge.svg)](https://github.com/Utkarsh272/mini-kafka/actions)
 [![Go 1.23](https://img.shields.io/badge/Go-1.23-00ADD8?logo=go)](https://go.dev)
@@ -14,7 +14,7 @@
 
 Most engineers use Kafka. Very few have built one.
 
-Mini-Kafka is a ground-up implementation of the core Kafka primitives — not a wrapper, not a toy that stops at "here's a queue." Every byte on disk, every field in the wire protocol, and every routing decision is written from scratch.
+Mini-Kafka is a ground-up implementation of the core Kafka primitives — not a wrapper, not a toy that stops at "here's a queue." Every byte on disk, every field in the wire protocol, every routing decision, and every consumer group state transition is written from scratch.
 
 The goal: understand the exact engineering decisions behind one of the most influential pieces of distributed infrastructure in modern software, by implementing it.
 
@@ -29,21 +29,33 @@ The goal: understand the exact engineering decisions behind one of the most infl
 The append-only log that everything else sits on.
 
 - **Segment files** — each partition is a directory of `.log` + `.index` file pairs named by their base offset (`00000000000000000000.log`). Segments roll at 1 MB.
-- **Sparse index** — one index entry per 512 bytes of log data. Each entry is `[relativeOffset: 4B][bytePosition: 4B]`. Reads binary-search the index to find the nearest position, then scan forward to the exact offset — O(log n) seek + O(1) scan.
-- **CRC32 validation** — every record carries a CRC32/IEEE checksum over its payload fields. Computed on write, validated on every read. Corrupted records return an error rather than silently serving bad data.
-- **Recovery on reopen** — `OpenLog` scans existing `.log` files to recover `nextOffset` without a separate WAL. Segments are reopened in base-offset order.
-- **`WriteAt`-based appends** — no `O_APPEND` flag. Byte position is tracked explicitly in `logSize` and written via `WriteAt`, so reads and writes can safely share the same file descriptor under a mutex.
+- **Sparse index** — one index entry per 512 bytes of log data, format `[relativeOffset: 4B][bytePosition: 4B]`. Reads binary-search the index to find the nearest position, then scan forward to the exact offset — O(log n) seek, O(1) scan.
+- **CRC32 validation** — every record carries a CRC32/IEEE checksum over its payload. Computed on write, validated on every read. Corrupted records return an error rather than silently serving bad data.
+- **Recovery on reopen** — `OpenLog` scans existing `.log` files to recover `nextOffset` without a separate WAL.
+- **`WriteAt`-based appends** — no `O_APPEND` flag. Byte position tracked explicitly so reads and writes safely share the same file descriptor under a mutex.
 
-**Record wire format** (binary, big-endian):
+**Record format** (binary, big-endian):
 ```
 [length: 4B][offset: 8B][timestamp: 8B][crc32: 4B][key_len: 4B][key][value_len: 4B][value]
 ```
 
 ### Broker layer (`internal/broker`)
 
-- **Partition routing** — keyed records use FNV-1a hash (`hash(key) % numPartitions`), producing stable per-key routing that preserves ordering guarantees. Keyless records round-robin via a per-topic `atomic.Uint64` counter — zero lock contention for concurrent producers.
-- **Metadata persistence** — topic configs (name, partition count, replication factor) are stored in an embedded [bbolt](https://github.com/etcd-io/bbolt) database (`meta.db`). On startup, all topics are replayed from bbolt and their partition logs reopened — topics survive broker restarts with no data loss.
-- **Consumer offset tracking** — per-partition, per-group committed offsets stored in memory. `CommitOffset` / `FetchOffset` are mutex-protected. (Persistence to an internal `__consumer_offsets` topic is coming in Days 7-9.)
+- **Partition routing** — keyed records use FNV-1a hash (`hash(key) % numPartitions`), giving stable per-key routing that preserves ordering. Keyless records round-robin via a per-topic `atomic.Uint64` counter — lock-free for concurrent producers.
+- **Metadata persistence** — topic configs (name, partition count, replication factor) stored in an embedded [bbolt](https://github.com/etcd-io/bbolt) database. On startup, topics are replayed from bbolt and partition logs reopened — no data loss across restarts.
+
+### Consumer groups (`internal/consumer_group`)
+
+Full implementation of the Kafka consumer group protocol:
+
+- **State machine** — `Empty → PreRebalance → AwaitingSync → Stable`. Each transition is correct and tested.
+- **JoinGroup** — connection goroutine parks inside the coordinator (exactly like Kafka) during a 500ms rebalance delay window that collects all joining members before closing the phase.
+- **SyncGroup** — leader submits assignment or lets the coordinator auto-compute it via the range assignor. All members park until the leader's call flushes assignments.
+- **Range assignor** — assigns `⌈partitions / members⌉` contiguous partitions per topic. Deterministic (sorted member IDs). Handles more members than partitions correctly.
+- **Heartbeat** — validates generation ID, refreshes last-seen timestamp. Returns `REBALANCE_IN_PROGRESS` during active rebalances.
+- **LeaveGroup** — removes member and triggers a new rebalance if group was Stable.
+- **Background reaper** — evicts members that miss their session timeout every 3 seconds.
+- **Durable offset store** — committed offsets written to an internal append-only log (`__consumer_offsets`). Replayed on startup so committed positions survive broker restarts.
 
 ### Wire protocol (`internal/protocol`)
 
@@ -56,23 +68,28 @@ Response: [length: 4B][correlation_id: 4B][error_code: 2B][payload]
 
 Implemented API keys:
 
-| Key | Name | Direction |
-|-----|------|-----------|
-| 0 | Produce | Producer → broker |
-| 1 | Fetch | Consumer → broker |
-| 2 | Metadata | Client → broker |
-| 6 | OffsetCommit | Consumer → broker |
-| 7 | OffsetFetch | Consumer → broker |
-| 10 | CreateTopic | Admin → broker |
+| Key | Name |
+|-----|------|
+| 0 | Produce |
+| 1 | Fetch |
+| 2 | Metadata |
+| 3 | JoinGroup |
+| 4 | SyncGroup |
+| 5 | Heartbeat |
+| 6 | OffsetCommit |
+| 7 | OffsetFetch |
+| 9 | LeaveGroup |
+| 10 | CreateTopic |
+| 11 | DescribeGroup |
 
-Planned: `JoinGroup(3)`, `SyncGroup(4)`, `Heartbeat(5)`, `FetchFollower(8)`, `LeaveGroup(9)`, `DescribeGroup(11)`
+Planned: `FetchFollower(8)` (replication, Days 10–12)
 
 ### TCP server (`internal/server`)
 
-- **Goroutine-per-connection** — each accepted TCP connection gets its own goroutine. `bufio.Reader` / `bufio.Writer` reduce syscall overhead on both read and write paths.
-- **Auto-routing on Produce** — `partitionID = -1` in a Produce request tells the broker to route using key hash or round-robin. Explicit partition IDs bypass routing.
-- **Correlation IDs** — every request carries a `correlation_id` that is echoed back in the response, allowing clients to pipeline requests without head-of-line blocking.
-- **Graceful shutdown** — `Server.Close()` stops the listener and waits for all in-flight connection goroutines via `sync.WaitGroup`.
+- **Goroutine-per-connection** with `bufio` buffering on both read and write paths.
+- **Auto-routing on Produce** — `partitionID = -1` tells the broker to route using key hash or round-robin.
+- **Correlation IDs** — every request carries a `correlation_id` echoed in the response, enabling client-side request pipelining.
+- **Graceful shutdown** via `sync.WaitGroup` on all active connection goroutines.
 
 ---
 
@@ -80,20 +97,18 @@ Planned: `JoinGroup(3)`, `SyncGroup(4)`, `Heartbeat(5)`, `FetchFollower(8)`, `Le
 
 ```mermaid
 graph LR
-    Producer -->|Produce API| Server
-    Consumer -->|Fetch API| Server
+    Producer -->|Produce| Server
+    Consumer -->|Fetch / JoinGroup / SyncGroup| Server
     Admin -->|CreateTopic / Metadata| Server
 
     subgraph "Broker process"
-        Server -->|dispatch| Handler
+        Server --> Handler
         Handler --> Broker
+        Handler --> Coordinator["Consumer Group\nCoordinator"]
         Broker --> Router["Router\n(FNV-1a / round-robin)"]
-        Broker --> MetaDB["bbolt meta.db\n(topic configs)"]
-        Broker --> Topic
-        Topic --> Partition0
-        Topic --> Partition1
-        Topic --> PartitionN
-        Partition0 --> Log0["Log\n(segment files)"]
+        Broker --> MetaDB["bbolt meta.db"]
+        Broker --> Topic --> Partition --> Log["Log\n(segment files)"]
+        Coordinator --> OffsetStore["Offset Store\n(__consumer_offsets log)"]
     end
 ```
 
@@ -101,15 +116,15 @@ graph LR
 
 ```
 <data-dir>/
-├── meta.db                              # bbolt: topic configs survive restarts
-├── orders-0/                            # topic "orders", partition 0
+├── meta.db                          # bbolt: topic configs
+├── __consumer_offsets/              # durable committed offset log
+│   ├── 00000000000000000000.log
+│   └── 00000000000000000000.index
+├── orders-0/                        # topic "orders", partition 0
 │   ├── 00000000000000000000.log
 │   ├── 00000000000000000000.index
-│   ├── 00000000000000001024.log         # rolled at 1 MB
-│   └── 00000000000000001024.index
-├── orders-1/
 │   └── ...
-└── events-0/
+└── orders-1/
     └── ...
 ```
 
@@ -117,32 +132,28 @@ graph LR
 
 ## Wire Protocol
 
-### Produce request (partitionID = -1 → broker routes)
+### Produce (partitionID = -1 → broker routes)
 ```
-acks:           int16
-timeout_ms:     int32
-topic_count:    int32
-  topic:        string (2B len + bytes)
-  part_count:   int32
-    partition:  int32   (-1 = auto-route by key)
-    rec_count:  int32
-      key_len:  int32   (-1 = null/keyless → round-robin)
-      key:      bytes
-      val_len:  int32
-      val:      bytes
+acks: int16 | timeout_ms: int32 | topic_count: int32
+  topic: string | part_count: int32
+    partition: int32  (-1 = auto-route)
+    rec_count: int32
+      key_len: int32  (-1 = null → round-robin) | key: bytes
+      val_len: int32 | val: bytes
 ```
 
-### Fetch request
+### JoinGroup
 ```
-max_wait_ms:    int32
-min_bytes:      int32
-max_bytes:      int32
-topic_count:    int32
-  topic:        string
-  part_count:   int32
-    partition:  int32
-    offset:     int64   (fetch from here)
-    max_bytes:  int32
+group_id: string | session_timeout: int32 | member_id: string
+topic_count: int32 | topic: string ...
+```
+
+### SyncGroup
+```
+group_id: string | generation_id: int32 | member_id: string
+assign_count: int32
+  member_id: string | topic_count: int32
+    topic: string | part_count: int32 | partition: int32 ...
 ```
 
 ---
@@ -153,47 +164,34 @@ topic_count:    int32
 git clone https://github.com/Utkarsh272/mini-kafka
 cd mini-kafka
 
-# Build the broker binary
+# Build
 go build -o bin/broker ./cmd/broker
 
-# Start a broker (data stored in /tmp/mini-kafka)
+# Start a broker
 ./bin/broker --addr :9092 --data-dir /tmp/mini-kafka --node-id 1
 
-# Run all tests
+# Test
 go test ./...
-
-# Run with race detector
 go test -race ./...
 ```
 
-### Smoke test via netcat (raw wire protocol)
-
-A proper CLI (`mk produce` / `mk consume`) is coming in Day 15. For now, use the integration tests as the canonical client example — see `internal/server/server_test.go` for a complete `testClient` implementation with encode helpers for every API.
+See `internal/server/server_test.go` for a complete wire-protocol client with helpers for every API — the canonical way to interact with the broker until the CLI ships in Day 15.
 
 ---
 
 ## Testing
 
-```
-internal/storage/  →  record encode/decode, CRC corruption detection,
-                       segment append/read/reopen, index file creation,
-                       log rolling, cross-segment reads, 10K record volume test
-
-internal/broker/   →  FNV-1a hash stability, round-robin distribution,
-                       topic create/get/list, metadata persistence across
-                       restarts (LEO recovery), offset commit/fetch
-
-internal/server/   →  full TCP integration tests — CreateTopic, Produce
-                       (explicit partition + auto-route), Fetch, Metadata
-                       (specific topic + all-topics), OffsetCommit/Fetch,
-                       duplicate topic, correlation ID mirroring
-```
+| Package | Coverage |
+|---------|----------|
+| `internal/storage` | Encode/decode, CRC corruption detection, segment append/read/reopen, log rolling, cross-segment reads, 10K record volume |
+| `internal/broker` | Hash stability, round-robin distribution, topic CRUD, metadata persistence across restarts, LEO recovery |
+| `internal/consumer_group` | Full Join+Sync cycles, range assignor (1/2/3 members, more members than partitions), heartbeat validation, leave+rebalance, offset persistence across restarts |
+| `internal/server` | TCP integration — CreateTopic, Produce (explicit + auto-route), Fetch, Metadata, OffsetCommit/Fetch, DescribeGroup, correlation ID mirroring |
 
 ```bash
-go test ./...               # all packages
-go test -race ./...         # with race detector
-go test -v -run TestLog ... # specific test
-go test -short ./...        # skip large volume tests
+go test ./...        # all packages
+go test -race ./...  # with race detector
+go test -short ./... # skip large volume tests
 ```
 
 ---
@@ -202,23 +200,27 @@ go test -short ./...        # skip large volume tests
 
 ### Why `WriteAt` instead of `O_APPEND`?
 
-`O_APPEND` is POSIX-atomic but makes any `Seek` + `Write` for in-place corruption testing impossible — the kernel ignores the seek and always writes to EOF. Using `WriteAt` with an explicit `logSize` position is equally correct for a single writer (mutex-protected), doesn't suffer from the seek-is-ignored problem, and lets tests corrupt specific byte offsets to validate checksum detection.
+`O_APPEND` is POSIX-atomic but the kernel ignores any preceding `Seek` — every write goes to EOF regardless. `WriteAt` with an explicit tracked position is equally safe under a mutex, and lets tests corrupt specific byte offsets to validate checksum detection.
 
 ### Why FNV-1a for key routing?
 
-Same algorithm as Kafka's `DefaultPartitioner`. Non-cryptographic, extremely fast, good distribution, and — critically — the same key always maps to the same partition regardless of which broker or producer instance computes it. This is the property that gives per-key ordering guarantees.
+Same algorithm as Kafka's `DefaultPartitioner`. Fast, good distribution, and the same key always maps to the same partition regardless of which producer instance computes it — the property that gives per-key ordering guarantees.
 
-### Why bbolt for metadata?
+### Why block the connection goroutine in JoinGroup?
 
-Embedded, no external process, ACID transactions, and a simple bucket/key/value API that maps directly to our schema. The alternative (flat files + fsync) would require reimplementing crash recovery. bbolt's B+ tree gives O(log n) reads and a single write lock per database file — exactly right for a single-broker metadata store.
+This is exactly what Kafka does. The connection goroutine parks inside `Coordinator.JoinGroup` for the duration of the rebalance delay. The alternative (async callbacks) would require a complex response-routing layer with no benefit — the client is already blocked waiting for the response anyway.
 
-### Why store topic metadata before exposing the topic?
+### Why auto-compute assignment when SyncGroup has empty assignments?
 
-`CreateTopic` calls `openTopic` (creates log directories) then `metadata.saveTopic` (writes to bbolt). If the process crashes between them, orphaned log directories exist but bbolt has no record — the next startup ignores them (harmless). The reverse ordering (save to bbolt first) would cause replay to fail on restart if the directories weren't created yet, which is a harder failure to handle.
+Simplifies client implementation significantly. Real Kafka requires the leader to compute and send the full assignment. Here, the leader can send an empty list and the coordinator runs the range assignor — useful for tests and simple clients that don't want to implement the assignor themselves.
 
-### Why round-robin for keyless records?
+### Why a separate offset log instead of bbolt?
 
-Even load distribution across partitions when the producer doesn't care about ordering. The atomic counter is per-topic and lock-free (`atomic.Uint64`), so concurrent producers on the same topic don't contend.
+Offset commits are high-frequency writes. An append-only log is O(1) per commit and never requires random writes. bbolt would need a write transaction per commit, adding B+ tree overhead. The log is replayed forward on startup — the latest record per key wins.
+
+### Why `openTopic` before `metadata.saveTopic`?
+
+If the broker crashes between the two calls, orphaned log directories exist but bbolt has no record — harmless on next startup. The reverse (save first) would cause replay to fail if directories weren't created yet, which is harder to recover from.
 
 ---
 
@@ -226,15 +228,15 @@ Even load distribution across partitions when the producer doesn't care about or
 
 | Days | Goal | Status |
 |------|------|--------|
-| 1–2 | Segment files, sparse index, CRC, Log API | ✅ Done |
-| 3–4 | Wire protocol, TCP server, Produce/Fetch/Metadata/OffsetCommit | ✅ Done |
-| 5–6 | Partition routing (FNV-1a + round-robin), bbolt metadata persistence | ✅ Done |
-| 7–9 | Consumer groups: JoinGroup, SyncGroup, Heartbeat, range assignor | 🔲 |
-| 10–12 | ISR replication: FetchFollower loop, high-watermark, read-committed | 🔲 |
-| 13–14 | Multi-broker cluster (Docker Compose, 3 brokers) | 🔲 |
+| 1–2 | Segment files, sparse index, CRC, Log API | ✅ |
+| 3–4 | Wire protocol, TCP server, Produce/Fetch/Metadata | ✅ |
+| 5–6 | Partition routing, bbolt metadata persistence | ✅ |
+| 7–9 | Consumer groups, range assignor, durable offset store | ✅ |
+| 10–12 | ISR replication: FetchFollower loop, high-watermark | 🔲 |
+| 13–14 | Multi-broker Docker Compose cluster | 🔲 |
 | 15 | CLI: `mk produce`, `mk consume`, `mk topics`, `mk groups` | 🔲 |
-| 16–17 | Next.js + TypeScript dashboard (lag, ISR, msgs/sec) | 🔲 |
-| 18 | Prometheus metrics, Grafana, load benchmark, DESIGN.md | 🔲 |
+| 16–17 | Next.js + TypeScript dashboard | 🔲 |
+| 18 | Prometheus metrics, load benchmark, DESIGN.md | 🔲 |
 
 ---
 
@@ -244,8 +246,8 @@ Even load distribution across partitions when the producer doesn't care about or
 |-------|--------|
 | Language | Go 1.23 |
 | Storage | `os.File` + custom binary serialization |
-| Metadata | `go.etcd.io/bbolt` (embedded BoltDB) |
-| Wire protocol | Custom binary TCP (no Kafka client compat) |
+| Metadata | `go.etcd.io/bbolt` |
+| Wire protocol | Custom binary TCP |
 | Dashboard (planned) | Next.js + TypeScript + Recharts |
 | Metrics (planned) | `prometheus/client_golang` |
 
