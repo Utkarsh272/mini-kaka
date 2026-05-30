@@ -5,16 +5,24 @@ import (
 	"sync"
 
 	"github.com/Utkarsh272/mini-kafka/internal/consumer_group"
+	"github.com/Utkarsh272/mini-kafka/internal/replication"
 	"github.com/Utkarsh272/mini-kafka/internal/storage"
 )
 
-// Partition holds the append-only log for one partition plus in-memory
-// consumer group offset tracking.
+// Partition holds the append-only log for one partition, its ISR tracker
+// (leader only), its follower fetcher (follower only), and in-memory consumer
+// group offset tracking.
 type Partition struct {
 	mu               sync.RWMutex
 	id               int32
 	log              *storage.Log
-	committedOffsets map[string]int64 // groupID → last committed offset (in-memory fallback)
+	committedOffsets map[string]int64
+
+	// ISR tracker — non-nil only on the leader replica.
+	isr *replication.ISRTracker
+
+	// Follower fetcher — non-nil only on follower replicas.
+	fetcher *replication.FollowerFetcher
 }
 
 func newPartition(id int32, log *storage.Log) *Partition {
@@ -44,19 +52,51 @@ func (p *Partition) LogEndOffset() int64 {
 	return int64(p.log.LogEndOffset())
 }
 
-// HighWatermark is the LEO for single-broker mode.
+// HighWatermark returns the high-watermark:
+//   - If this partition has an ISR tracker (leader), it is the minimum LEO
+//     across all in-sync replicas.
+//   - Otherwise (follower or single-broker), it equals the LEO.
 func (p *Partition) HighWatermark() int64 {
+	p.mu.RLock()
+	isr := p.isr
+	p.mu.RUnlock()
+
+	if isr != nil {
+		return isr.HighWatermark()
+	}
 	return p.LogEndOffset()
 }
 
-// CommitOffset stores the consumed offset for a consumer group (in-memory).
+// ISRTracker returns the partition's ISR tracker, or nil if this is a follower.
+func (p *Partition) ISRTracker() *replication.ISRTracker {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.isr
+}
+
+// SetISRTracker attaches an ISR tracker to this partition (called on the leader).
+func (p *Partition) SetISRTracker(t *replication.ISRTracker) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.isr = t
+}
+
+// SetFollowerFetcher attaches a follower fetcher and starts it.
+func (p *Partition) SetFollowerFetcher(f *replication.FollowerFetcher) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.fetcher = f
+	f.Start()
+}
+
+// CommitOffset stores the consumed offset for a consumer group.
 func (p *Partition) CommitOffset(groupID string, offset int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.committedOffsets[groupID] = offset
 }
 
-// FetchOffset returns the committed offset for a group, or -1 if none exists.
+// FetchOffset returns the committed offset for a group, or -1 if none.
 func (p *Partition) FetchOffset(groupID string) int64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -67,7 +107,17 @@ func (p *Partition) FetchOffset(groupID string) int64 {
 	return off
 }
 
-// Topic holds all partitions for one topic plus its round-robin router state.
+// stopReplication stops the follower fetcher if running.
+func (p *Partition) stopReplication() {
+	p.mu.Lock()
+	f := p.fetcher
+	p.mu.Unlock()
+	if f != nil {
+		f.Stop()
+	}
+}
+
+// Topic holds all partitions for one topic.
 type Topic struct {
 	name              string
 	partitions        []*Partition
@@ -75,8 +125,8 @@ type Topic struct {
 	rrCounter         roundRobinCounter
 }
 
-func (t *Topic) Name() string           { return t.name }
-func (t *Topic) NumPartitions() int     { return len(t.partitions) }
+func (t *Topic) Name() string             { return t.name }
+func (t *Topic) NumPartitions() int       { return len(t.partitions) }
 func (t *Topic) ReplicationFactor() int32 { return t.replicationFactor }
 func (t *Topic) Partition(id int32) *Partition {
 	if id < 0 || int(id) >= len(t.partitions) {
@@ -125,8 +175,6 @@ func NewBroker(nodeID int32, host string, port int32, dataDir string) (*Broker, 
 		OffsetStore: offsetStore,
 	}
 
-	// getPartitions closure injected into the coordinator so it can look up
-	// partition counts during range assignment without importing broker.
 	b.Coordinator = consumer_group.NewCoordinator(func(topic string) (int32, error) {
 		b.mu.RLock()
 		defer b.mu.RUnlock()
@@ -175,6 +223,58 @@ func (b *Broker) openTopic(name string, numPartitions, replicationFactor int32) 
 		t.partitions = append(t.partitions, newPartition(i, log))
 	}
 	return t, nil
+}
+
+// InitLeaderISR attaches an ISR tracker to a partition, designating this
+// broker as the leader for that partition. replicaNodeIDs should include this
+// broker's nodeID plus all follower node IDs.
+func (b *Broker) InitLeaderISR(topic string, partitionID int32, replicaNodeIDs []int32) error {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	t, ok := b.topics[topic]
+	if !ok {
+		return fmt.Errorf("unknown topic %q", topic)
+	}
+	if partitionID < 0 || int(partitionID) >= len(t.partitions) {
+		return fmt.Errorf("unknown partition %d", partitionID)
+	}
+
+	p := t.partitions[partitionID]
+	tracker := replication.NewISRTracker(
+		b.nodeID,
+		replicaNodeIDs,
+		func() int64 { return p.LogEndOffset() },
+	)
+	p.SetISRTracker(tracker)
+	return nil
+}
+
+// InitFollowerFetcher starts a follower fetcher for a partition, designating
+// this broker as a follower that replicates from leaderAddr.
+func (b *Broker) InitFollowerFetcher(topic string, partitionID int32, leaderAddr string) error {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	t, ok := b.topics[topic]
+	if !ok {
+		return fmt.Errorf("unknown topic %q", topic)
+	}
+	if partitionID < 0 || int(partitionID) >= len(t.partitions) {
+		return fmt.Errorf("unknown partition %d", partitionID)
+	}
+
+	p := t.partitions[partitionID]
+	fetcher := replication.NewFollowerFetcher(
+		b.nodeID,
+		leaderAddr,
+		topic,
+		partitionID,
+		p.log,
+		nil, // onFetch not needed — leader learns offset from the request itself
+	)
+	p.SetFollowerFetcher(fetcher)
+	return nil
 }
 
 func (b *Broker) NodeID() int32 { return b.nodeID }
@@ -254,8 +354,10 @@ func (b *Broker) TopicExists(name string) bool {
 func (b *Broker) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	for _, t := range b.topics {
 		for _, p := range t.partitions {
+			p.stopReplication()
 			if err := p.log.Close(); err != nil {
 				return err
 			}

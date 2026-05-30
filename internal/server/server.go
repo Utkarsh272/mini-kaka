@@ -11,9 +11,9 @@ import (
 	"github.com/Utkarsh272/mini-kafka/internal/broker"
 	"github.com/Utkarsh272/mini-kafka/internal/consumer_group"
 	"github.com/Utkarsh272/mini-kafka/internal/protocol"
+	"github.com/Utkarsh272/mini-kafka/internal/replication"
 )
 
-// Handler dispatches incoming requests to the right broker operation.
 type Handler struct {
 	broker *broker.Broker
 }
@@ -40,6 +40,8 @@ func (h *Handler) Handle(w io.Writer, hdr protocol.RequestHeader, payload []byte
 		h.handleOffsetCommit(w, hdr, payload)
 	case protocol.APIKeyOffsetFetch:
 		h.handleOffsetFetch(w, hdr, payload)
+	case protocol.APIKeyFetchFollower:
+		h.handleFetchFollower(w, hdr, payload)
 	case protocol.APIKeyLeaveGroup:
 		h.handleLeaveGroup(w, hdr, payload)
 	case protocol.APIKeyCreateTopic:
@@ -73,9 +75,7 @@ func (h *Handler) handleProduce(w io.Writer, hdr protocol.RequestHeader, payload
 					partID, err := h.broker.RoutePartition(t.Topic, rec.Key)
 					if err != nil {
 						tr.Partitions = append(tr.Partitions, protocol.ProducePartitionResult{
-							PartitionID: -1,
-							ErrorCode:   protocol.ErrUnknownTopicPartition,
-							BaseOffset:  -1,
+							PartitionID: -1, ErrorCode: protocol.ErrUnknownTopicPartition, BaseOffset: -1,
 						})
 						goto nextPartition
 					}
@@ -90,7 +90,7 @@ func (h *Handler) handleProduce(w io.Writer, hdr protocol.RequestHeader, payload
 					}
 					off, err := part.Append(rec.Key, rec.Value)
 					if err != nil {
-						slog.Error("append record", "topic", t.Topic, "partition", partID, "err", err)
+						slog.Error("append", "topic", t.Topic, "partition", partID, "err", err)
 						if _, seen := routedResults[partID]; !seen {
 							routedResults[partID] = &protocol.ProducePartitionResult{
 								PartitionID: partID, ErrorCode: protocol.ErrUnknown, BaseOffset: -1,
@@ -120,7 +120,7 @@ func (h *Handler) handleProduce(w io.Writer, hdr protocol.RequestHeader, payload
 				for i, rec := range pp.Records {
 					off, err := part.Append(rec.Key, rec.Value)
 					if err != nil {
-						slog.Error("append record", "topic", t.Topic, "partition", targetPartID, "err", err)
+						slog.Error("append", "topic", t.Topic, "partition", targetPartID, "err", err)
 						errCode = protocol.ErrUnknown
 						break
 					}
@@ -136,7 +136,6 @@ func (h *Handler) handleProduce(w io.Writer, hdr protocol.RequestHeader, payload
 		}
 		topicResults = append(topicResults, tr)
 	}
-
 	protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrNone,
 		protocol.EncodeProduceResponse(topicResults))
 }
@@ -173,8 +172,7 @@ func (h *Handler) handleFetch(w io.Writer, hdr protocol.RequestHeader, payload [
 			}
 			records, err := part.ReadBatch(fp.FetchOffset, perPartMax)
 			if err != nil {
-				slog.Warn("read batch", "topic", t.Topic, "partition", fp.PartitionID,
-					"offset", fp.FetchOffset, "err", err)
+				slog.Warn("read batch", "topic", t.Topic, "partition", fp.PartitionID, "err", err)
 				tr.Partitions = append(tr.Partitions, protocol.FetchPartitionResult{
 					PartitionID: fp.PartitionID, ErrorCode: protocol.ErrOffsetOutOfRange,
 					HighWatermark: part.HighWatermark(),
@@ -197,6 +195,57 @@ func (h *Handler) handleFetch(w io.Writer, hdr protocol.RequestHeader, payload [
 	}
 	protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrNone,
 		protocol.EncodeFetchResponse(topicResults))
+}
+
+// ---- FetchFollower (API key 8) ---------------------------------------------
+
+// handleFetchFollower serves replication fetch requests from follower brokers.
+// Returns records starting at the follower's current LEO plus the leader's LEO.
+// ISR tracking via follower nodeID is a Day 13 (multi-broker) concern — the
+// FetchFollower request payload does not yet carry a nodeID field.
+func (h *Handler) handleFetchFollower(w io.Writer, hdr protocol.RequestHeader, payload []byte) {
+	req, err := replication.DecodeFetchFollowerRequest(payload)
+	if err != nil {
+		slog.Error("decode fetch follower", "err", err)
+		w.Write(replication.EncodeFetchFollowerResponse(hdr.CorrelationID,
+			replication.FetchFollowerResponse{ErrorCode: -1}))
+		return
+	}
+
+	part, err := h.broker.GetPartition(req.Topic, req.Partition)
+	if err != nil {
+		slog.Warn("fetch follower: unknown partition", "topic", req.Topic, "partition", req.Partition)
+		w.Write(replication.EncodeFetchFollowerResponse(hdr.CorrelationID,
+			replication.FetchFollowerResponse{ErrorCode: 3}))
+		return
+	}
+
+	maxBytes := int64(req.MaxBytes)
+	if maxBytes <= 0 {
+		maxBytes = 1 << 20
+	}
+
+	records, err := part.ReadBatch(req.FromOffset, maxBytes)
+	if err != nil {
+		w.Write(replication.EncodeFetchFollowerResponse(hdr.CorrelationID,
+			replication.FetchFollowerResponse{ErrorCode: 1, LeaderLEO: part.LogEndOffset()}))
+		return
+	}
+
+	var fetchRecords []replication.FetchFollowerRecord
+	for _, r := range records {
+		fetchRecords = append(fetchRecords, replication.FetchFollowerRecord{
+			Offset: int64(r.Offset), Timestamp: int64(r.Timestamp),
+			Key: r.Key, Value: r.Value,
+		})
+	}
+
+	w.Write(replication.EncodeFetchFollowerResponse(hdr.CorrelationID,
+		replication.FetchFollowerResponse{
+			ErrorCode: 0,
+			LeaderLEO: part.LogEndOffset(),
+			Records:   fetchRecords,
+		}))
 }
 
 // ---- Metadata --------------------------------------------------------------
@@ -253,10 +302,6 @@ func (h *Handler) handleMetadata(w io.Writer, hdr protocol.RequestHeader, payloa
 
 // ---- JoinGroup -------------------------------------------------------------
 
-// handleJoinGroup blocks inside broker.Coordinator.JoinGroup until the
-// rebalance delay window closes and all pending members have joined. The
-// connection goroutine is parked here intentionally — this is exactly how
-// Kafka handles it.
 func (h *Handler) handleJoinGroup(w io.Writer, hdr protocol.RequestHeader, payload []byte) {
 	req, err := protocol.DecodeJoinGroupRequest(payload)
 	if err != nil {
@@ -264,28 +309,17 @@ func (h *Handler) handleJoinGroup(w io.Writer, hdr protocol.RequestHeader, paylo
 		protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrInvalidRequest, nil)
 		return
 	}
-
 	resp := h.broker.Coordinator.JoinGroup(consumer_group.JoinGroupRequest{
-		GroupID:        req.GroupID,
-		SessionTimeout: req.SessionTimeout,
-		MemberID:       req.MemberID,
-		ClientID:       hdr.ClientID,
-		Topics:         req.Topics,
+		GroupID: req.GroupID, SessionTimeout: req.SessionTimeout,
+		MemberID: req.MemberID, ClientID: hdr.ClientID, Topics: req.Topics,
 	})
-
 	var members []protocol.JoinGroupMemberInfo
 	for _, m := range resp.Members {
-		members = append(members, protocol.JoinGroupMemberInfo{
-			MemberID: m.MemberID,
-			Topics:   m.Topics,
-		})
+		members = append(members, protocol.JoinGroupMemberInfo{MemberID: m.MemberID, Topics: m.Topics})
 	}
-
 	protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrNone,
-		protocol.EncodeJoinGroupResponse(
-			resp.ErrorCode, resp.GenerationID, resp.GroupProtocol,
-			resp.LeaderID, resp.MemberID, members,
-		))
+		protocol.EncodeJoinGroupResponse(resp.ErrorCode, resp.GenerationID, resp.GroupProtocol,
+			resp.LeaderID, resp.MemberID, members))
 }
 
 // ---- SyncGroup -------------------------------------------------------------
@@ -297,40 +331,28 @@ func (h *Handler) handleSyncGroup(w io.Writer, hdr protocol.RequestHeader, paylo
 		protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrInvalidRequest, nil)
 		return
 	}
-
-	// Convert wire assignments to coordinator type.
 	var assignments []consumer_group.MemberAssignment
 	for _, a := range req.Assignments {
 		ma := consumer_group.MemberAssignment{MemberID: a.MemberID}
 		for _, tpa := range a.Assignment {
 			for _, p := range tpa.Partitions {
-				ma.Partitions = append(ma.Partitions, consumer_group.TopicPartition{
-					Topic: tpa.Topic, Partition: p,
-				})
+				ma.Partitions = append(ma.Partitions, consumer_group.TopicPartition{Topic: tpa.Topic, Partition: p})
 			}
 		}
 		assignments = append(assignments, ma)
 	}
-
 	resp := h.broker.Coordinator.SyncGroup(consumer_group.SyncGroupRequest{
-		GroupID:      req.GroupID,
-		GenerationID: req.GenerationID,
-		MemberID:     req.MemberID,
-		Assignments:  assignments,
+		GroupID: req.GroupID, GenerationID: req.GenerationID,
+		MemberID: req.MemberID, Assignments: assignments,
 	})
-
-	// Convert coordinator assignment to wire format grouped by topic.
 	topicMap := make(map[string][]int32)
 	for _, tp := range resp.Assignment {
 		topicMap[tp.Topic] = append(topicMap[tp.Topic], tp.Partition)
 	}
 	var wireAssignment []protocol.SyncGroupTopicAssignment
 	for topic, parts := range topicMap {
-		wireAssignment = append(wireAssignment, protocol.SyncGroupTopicAssignment{
-			Topic: topic, Partitions: parts,
-		})
+		wireAssignment = append(wireAssignment, protocol.SyncGroupTopicAssignment{Topic: topic, Partitions: parts})
 	}
-
 	protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrNone,
 		protocol.EncodeSyncGroupResponse(resp.ErrorCode, wireAssignment))
 }
@@ -344,21 +366,15 @@ func (h *Handler) handleHeartbeat(w io.Writer, hdr protocol.RequestHeader, paylo
 		protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrInvalidRequest, nil)
 		return
 	}
-
 	resp := h.broker.Coordinator.Heartbeat(consumer_group.HeartbeatRequest{
-		GroupID:      req.GroupID,
-		GenerationID: req.GenerationID,
-		MemberID:     req.MemberID,
+		GroupID: req.GroupID, GenerationID: req.GenerationID, MemberID: req.MemberID,
 	})
-
 	protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrNone,
 		protocol.EncodeHeartbeatResponse(resp.ErrorCode))
 }
 
 // ---- OffsetCommit ----------------------------------------------------------
 
-// handleOffsetCommit persists offsets to the OffsetStore (durable log) and
-// also keeps the in-memory per-partition map in sync for fast FetchOffset reads.
 func (h *Handler) handleOffsetCommit(w io.Writer, hdr protocol.RequestHeader, payload []byte) {
 	req, err := protocol.DecodeOffsetCommitRequest(payload)
 	if err != nil {
@@ -366,7 +382,6 @@ func (h *Handler) handleOffsetCommit(w io.Writer, hdr protocol.RequestHeader, pa
 		protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrInvalidRequest, nil)
 		return
 	}
-
 	var topicResults []protocol.OffsetCommitTopicResult
 	for _, t := range req.Topics {
 		tr := protocol.OffsetCommitTopicResult{Topic: t.Topic}
@@ -378,34 +393,26 @@ func (h *Handler) handleOffsetCommit(w io.Writer, hdr protocol.RequestHeader, pa
 				})
 				continue
 			}
-
-			// Persist to durable offset log.
 			if err := h.broker.OffsetStore.Commit(req.GroupID, t.Topic, p.PartitionID, p.Offset); err != nil {
-				slog.Error("persist offset", "group", req.GroupID, "topic", t.Topic,
-					"partition", p.PartitionID, "err", err)
+				slog.Error("persist offset", "err", err)
 				tr.Partitions = append(tr.Partitions, protocol.OffsetCommitPartitionResult{
 					PartitionID: p.PartitionID, ErrorCode: protocol.ErrUnknown,
 				})
 				continue
 			}
-
-			// Keep in-memory map consistent for O(1) FetchOffset reads.
 			part.CommitOffset(req.GroupID, p.Offset)
-
 			tr.Partitions = append(tr.Partitions, protocol.OffsetCommitPartitionResult{
 				PartitionID: p.PartitionID, ErrorCode: protocol.ErrNone,
 			})
 		}
 		topicResults = append(topicResults, tr)
 	}
-
 	protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrNone,
 		protocol.EncodeOffsetCommitResponse(topicResults))
 }
 
 // ---- OffsetFetch -----------------------------------------------------------
 
-// handleOffsetFetch reads from the OffsetStore (durable, survives restarts).
 func (h *Handler) handleOffsetFetch(w io.Writer, hdr protocol.RequestHeader, payload []byte) {
 	req, err := protocol.DecodeOffsetFetchRequest(payload)
 	if err != nil {
@@ -413,15 +420,13 @@ func (h *Handler) handleOffsetFetch(w io.Writer, hdr protocol.RequestHeader, pay
 		protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrInvalidRequest, nil)
 		return
 	}
-
 	var topicResults []protocol.OffsetFetchTopicResult
 	for _, t := range req.Topics {
 		tr := protocol.OffsetFetchTopicResult{Topic: t.Topic}
 		for _, p := range t.Partitions {
 			if _, err := h.broker.GetPartition(t.Topic, p.PartitionID); err != nil {
 				tr.Partitions = append(tr.Partitions, protocol.OffsetFetchPartitionResult{
-					PartitionID: p.PartitionID, Offset: -1,
-					ErrorCode: protocol.ErrUnknownTopicPartition,
+					PartitionID: p.PartitionID, Offset: -1, ErrorCode: protocol.ErrUnknownTopicPartition,
 				})
 				continue
 			}
@@ -432,7 +437,6 @@ func (h *Handler) handleOffsetFetch(w io.Writer, hdr protocol.RequestHeader, pay
 		}
 		topicResults = append(topicResults, tr)
 	}
-
 	protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrNone,
 		protocol.EncodeOffsetFetchResponse(topicResults))
 }
@@ -446,12 +450,9 @@ func (h *Handler) handleLeaveGroup(w io.Writer, hdr protocol.RequestHeader, payl
 		protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrInvalidRequest, nil)
 		return
 	}
-
 	resp := h.broker.Coordinator.LeaveGroup(consumer_group.LeaveGroupRequest{
-		GroupID:  req.GroupID,
-		MemberID: req.MemberID,
+		GroupID: req.GroupID, MemberID: req.MemberID,
 	})
-
 	protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrNone,
 		protocol.EncodeLeaveGroupResponse(resp.ErrorCode))
 }
@@ -490,34 +491,24 @@ func (h *Handler) handleDescribeGroup(w io.Writer, hdr protocol.RequestHeader, p
 		protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrInvalidRequest, nil)
 		return
 	}
-
 	desc := h.broker.Coordinator.DescribeGroup(req.GroupID)
-
 	var members []protocol.DescribeGroupMember
 	for _, m := range desc.Members {
-		// Group by topic for wire format.
 		topicMap := make(map[string][]int32)
 		for _, tp := range m.Assignment {
 			topicMap[tp.Topic] = append(topicMap[tp.Topic], tp.Partition)
 		}
 		var assignment []protocol.TopicPartitionAssignment
 		for topic, parts := range topicMap {
-			assignment = append(assignment, protocol.TopicPartitionAssignment{
-				Topic: topic, Partitions: parts,
-			})
+			assignment = append(assignment, protocol.TopicPartitionAssignment{Topic: topic, Partitions: parts})
 		}
 		members = append(members, protocol.DescribeGroupMember{
-			MemberID:   m.MemberID,
-			ClientID:   m.ClientID,
-			Assignment: assignment,
+			MemberID: m.MemberID, ClientID: m.ClientID, Assignment: assignment,
 		})
 	}
-
 	protocol.WriteResponse(w, hdr.CorrelationID, protocol.ErrNone,
-		protocol.EncodeDescribeGroupResponse(
-			desc.ErrorCode, desc.GroupID, desc.State, desc.LeaderID,
-			desc.GenerationID, members,
-		))
+		protocol.EncodeDescribeGroupResponse(desc.ErrorCode, desc.GroupID, desc.State,
+			desc.LeaderID, desc.GenerationID, members))
 }
 
 // ---- TCP Server ------------------------------------------------------------
@@ -540,7 +531,6 @@ func (s *Server) ListenAndServe() error {
 	}
 	s.listener = ln
 	slog.Info("broker listening", "addr", ln.Addr())
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
